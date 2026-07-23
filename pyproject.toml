@@ -1,0 +1,20 @@
+[project]
+name = "voice-input"
+version = "0.1.0"
+description = "Hold a hotkey, speak, get text at the cursor. Local whisper.cpp, no cloud."
+requires-python = ">=3.11"
+dependencies = ["numpy>=2.0", "sounddevice>=0.4.6", "pynput>=1.7.7"]
+
+[project.scripts]
+voice-input = "voiceinput.daemon:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["voiceinput"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

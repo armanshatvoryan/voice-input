@@ -1,0 +1,149 @@
+# voice-input
+
+Hold a hotkey, talk, release — the text lands at your cursor in whatever app is
+focused. Runs entirely on-device via `whisper.cpp`. No API key, no cloud, no
+per-minute cost.
+
+```
+HOLD  ctrl+alt+space  ──────────────►  release
+        [recording]                    [whisper]
+                                            ↓
+                                   pasted at the cursor
+```
+
+- **`ctrl+alt+space`** — dictate, paste the transcript verbatim.
+- **`ctrl+alt+shift+space`** — dictate, then run it through `claude -p` to fix
+  punctuation and drop filler before pasting (+2–4s).
+
+Auto-detects language per utterance. English and Russian both verified verbatim.
+
+## Setup
+
+```bash
+./scripts/setup.sh      # brew deps + venv + model (~1.6 GB on first run)
+./scripts/voice-input --doctor
+```
+
+### Permissions (the part that actually bites)
+
+macOS does not error when these are missing — it fails *silently*. The mic returns
+digital silence, hotkeys never fire, `⌘V` posts into the void. `--doctor` checks
+each one against the OS rather than guessing:
+
+| Permission | Needed for | Symptom when missing |
+|---|---|---|
+| **Microphone** | recording | transcribes nothing, every take is silent |
+| **Accessibility** | global hotkey + paste | hotkey does nothing at all |
+
+Grant both to **the terminal app you launch the daemon from** (Terminal, iTerm,
+Ghostty…), not to Python. Then **fully quit and reopen it** — permissions attach to
+the process at launch, so a new window in the old process still has the old rights.
+
+## Use
+
+```bash
+./scripts/voice-input                 # start the daemon, leave it running
+./scripts/voice-input --doctor        # check model, deps, permissions
+./scripts/voice-input --list-devices  # pick a mic for [audio] device
+./scripts/voice-input --transcribe f.wav   # headless, prints to stdout
+```
+
+The daemon starts `whisper-server` itself and shuts it down on exit. The model
+stays hot between utterances — that is the whole latency story. Point it at an
+already-running server with `--no-spawn`.
+
+Config lives in `config.toml`; copy it to `~/.config/voice-input/config.toml` to
+override without touching the repo.
+
+## How it works
+
+- **Always-open mic stream.** The input device is opened once at startup, not per
+  utterance, so pressing the hotkey costs no device-open delay. A 400ms ring buffer
+  runs continuously and is prepended to each take, so the syllable you started
+  before the key registered is still there.
+- **Persistent server.** A cold `whisper-cli` pays ~2s of model load (plus a one-off
+  ~15s Metal shader compile) *per utterance*. One warm server pays it once.
+- **Clipboard paste, not synthetic typing.** One event instead of hundreds, and it
+  survives Armenian/Russian text that per-character injection mangles under
+  non-US layouts. Your previous clipboard is restored afterwards, unless you copied
+  something else in the meantime.
+- **`claude -p` over stdin.** The transcript never touches the command line — it is
+  untrusted text and must not be able to shape a command.
+
+## Performance
+
+Measured on an M2 Air, `ggml-large-v3-turbo`, warm server:
+
+| audio length | time to paste |
+|---|---|
+| 2.3s | ~1.4s |
+| 5.8s | ~2.2s |
+| 16.0s | ~2.2s |
+
+Cost is roughly flat: whisper always encodes a padded 30s window, so a 2s clip
+costs about what a 25s clip does. Decoder knobs (`best_of`, `beam_size`,
+`no_fallback`) changed nothing measurable — the time is encoder-bound on the GPU.
+
+## Why `audio_ctx` is off by default
+
+Shrinking whisper's encoder context (`audio_ctx`) roughly halves latency and is the
+usual advice for realtime use. **It was measured here and rejected as a default.**
+
+It fails *silently* — wrong words, not an error — and not monotonically, so no
+formula can pick a safe value. Same 5.8s clip, same server:
+
+| audio_ctx | result |
+|---|---|
+| 512 | exact match |
+| 576 | `"We group.com E.W to with. 89 E, I.My, Ad care"` |
+| 640 | `"... ... ... ..."` (13.7s) |
+| 704 | wrong |
+| 768 | exact match |
+| 832, 896 | wrong |
+| 960, 1024, 1280 | exact match |
+
+Note 896 is *larger* than the working 768 and still corrupts, so "bigger is safer"
+does not hold. Undersizing also triggers whisper's repetition loop — a 9.7s clip at
+512 returned `"Codort banana. Codort banana. Codort banana."` — and the retries make
+it **slower** as well as wrong.
+
+For a tool whose output goes straight into your documents, ~1s is not worth a class
+of bug that quietly rewrites your words. Default is the full window.
+
+If you dictate only short bursts you can opt in with `[audio] context = 512`. Only
+512/768/1024/1280 were measured safe. Two guards stay on regardless: anything longer
+than the value covers is auto-promoted to full context, and a repetition detector
+redoes the take at full context if whisper stutters.
+
+## Layout
+
+```
+voiceinput/
+  daemon.py       wiring, CLI, --doctor
+  audio.py        always-open mic stream + pre-roll ring buffer
+  hotkeys.py      hold-to-talk state machine (pure) + pynput adapter
+  transcribe.py   whisper-server HTTP client
+  text.py         artifact stripping, repetition-loop detection
+  inject.py       clipboard + ⌘V
+  cleanup.py      claude -p pass
+  permissions.py  macOS privacy probes
+  server.py       whisper-server lifecycle
+```
+
+`pytest` — 54 tests, all pure logic (no mic, no server, no permissions needed).
+
+## Troubleshooting
+
+**Everything transcribes as nothing.** Microphone permission. `--doctor` reports the
+actual peak sample; 0 means the grant is missing.
+
+**Hotkey does nothing.** Accessibility, granted to the terminal app, then fully quit
+and reopen it.
+
+**`ctrl+alt+space` collides with something.** Change `[hotkey] modifiers` / `key`.
+The combo is not suppressed, so it also reaches the focused app.
+
+**Armenian is poor.** Expected — whisper's Armenian WER is high. Russian and English
+are solid.
+
+**Wrong mic.** `--list-devices`, then set `[audio] device = N`.

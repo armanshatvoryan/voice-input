@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Launcher: runs the daemon from the project venv regardless of where you call it from.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PY="$ROOT/.venv/bin/python"
+
+if [[ ! -x "$PY" ]]; then
+  echo "voice-input: no venv at $ROOT/.venv — run ./scripts/setup.sh first" >&2
+  exit 1
+fi
+exec "$PY" -m voiceinput.daemon "$@"
