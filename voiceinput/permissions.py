@@ -60,7 +60,8 @@ def microphone_peak(cfg: dict, seconds: float = 1.5) -> int:
 
 
 SETTINGS_HELP = (
-    "Open System Settings > Privacy & Security, add your terminal app under the listed\n"
-    "  section, enable it, then fully quit and reopen the terminal (a reopened window is\n"
-    "  not enough — the permission is granted to the process at launch)."
+    "Open System Settings > Privacy & Security, add the app that runs voice-input\n"
+    "  (your terminal, or Voice Input.app) under the listed section, enable it, then fully\n"
+    "  quit and relaunch that app — a reopened window is not enough, the permission is\n"
+    "  granted to the process at launch."
 )

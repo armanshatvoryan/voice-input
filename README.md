@@ -55,6 +55,52 @@ already-running server with `--no-spawn`.
 Config lives in `config.toml`; copy it to `~/.config/voice-input/config.toml` to
 override without touching the repo.
 
+## Run as a menu-bar app (recommended)
+
+Instead of parking a terminal, build a real `.app` bundle. The point is **identity**:
+macOS grants Microphone / Accessibility to an app, and a terminal or a tmux server is
+a fuzzy, shared, inheritable identity. A dedicated bundle is a stable one — grant it
+once and it works everywhere, including apps that spawn shells over tmux (e.g. an
+editor/cockpit whose panes would otherwise inherit some *other* app's grants).
+
+```bash
+./scripts/setup.sh                      # once, if you haven't
+./scripts/build_app.sh                  # builds ~/Applications/voice-input.app
+open ~/Applications/voice-input.app     # launches it (menu-bar glyph, no Dock icon)
+```
+
+Grant **Microphone** and **Accessibility** to **Voice Input** when prompted (or add it
+in System Settings › Privacy & Security), then relaunch it once. The menu-bar glyph
+tells you the state:
+
+| glyph | meaning |
+|---|---|
+| `…` | starting (model loading) |
+| `🎙` | listening — hold the hotkey to dictate |
+| `🔴` | recording |
+| `✦` | transcribing |
+| `⚠︎` | problem — click **Run doctor…** |
+
+The menu has Restart, **Run doctor…** (shows the same checks as the CLI), Open log, Quit.
+
+### Autostart at login
+
+```bash
+./scripts/install_launchagent.sh        # opens the app at login, starts it now
+./scripts/uninstall_launchagent.sh      # removes it (leaves the app + grants alone)
+```
+
+The LaunchAgent launches the app with `open`, so LaunchServices runs it as a normal
+GUI app and the TCC grant still attaches to the **bundle** — launchd does not bypass
+the app identity.
+
+### Re-granting after a rebuild
+
+The bundle is **ad-hoc signed** (no paid Developer ID). TCC keys the grant to the
+bundle's code hash, so re-running `build_app.sh` changes the hash and you may have to
+re-approve Microphone / Accessibility **once**. A Developer ID signature would make the
+grant survive rebuilds; not worth it for a personal tool.
+
 ## How it works
 
 - **Always-open mic stream.** The input device is opened once at startup, not per

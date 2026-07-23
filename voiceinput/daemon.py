@@ -36,7 +36,7 @@ def chime(cfg: dict, which: str) -> None:
 
 
 class Daemon:
-    def __init__(self, cfg: dict, spawn_server: bool = True):
+    def __init__(self, cfg: dict, spawn_server: bool = True, on_status=None):
         self.cfg = cfg
         self.spawn_server = spawn_server and cfg["server"]["spawn"]
         self.url = config.server_url(cfg)
@@ -44,8 +44,21 @@ class Daemon:
         self.server_proc: subprocess.Popen | None = None
         self.mic: audio.MicStream | None = None
         self.listener = None
+        self.worker: threading.Thread | None = None
         self.mode = "raw"
         self.stopping = threading.Event()
+        # Coarse lifecycle state the menu-bar app polls for its glyph. Plain string
+        # write is atomic under the GIL, so threads can set it without a lock.
+        self.state = "starting"
+        self.on_status = on_status
+
+    def set_state(self, state: str) -> None:
+        self.state = state
+        if self.on_status is not None:
+            try:
+                self.on_status(state)
+            except Exception:
+                pass
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -88,6 +101,7 @@ class Daemon:
                 self.server_proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self.server_proc.kill()
+        self.state = "stopped"
 
     # ---- hotkey events ---------------------------------------------------
 
@@ -96,6 +110,7 @@ class Daemon:
             self.mode = "cleanup" if event == hotkeys.START_CLEANUP else "raw"
             self.mic.start()
             chime(self.cfg, "start")
+            self.set_state("recording")
             log(f"recording ({self.mode})…")
         elif event == hotkeys.STOP:
             pcm = self.mic.stop()
@@ -144,14 +159,17 @@ class Daemon:
 
         if not pcm.any():
             chime(self.cfg, "error")
+            self.set_state("error")
             log("microphone returned pure silence — Microphone permission is missing "
                 "(run --doctor)")
             return
 
+        self.set_state("working")
         started = time.monotonic()
         spoken = self.speech_to_text(audio.to_wav(pcm, sr), length / 1000)
         if not spoken:
             chime(self.cfg, "error")
+            self.set_state("error")
             log(f"nothing recognised in {length / 1000:.1f}s of audio")
             return
 
@@ -162,21 +180,40 @@ class Daemon:
 
         inject.inject(spoken, self.cfg)
         chime(self.cfg, "done")
+        self.set_state("idle")
         log(f"{length / 1000:.1f}s audio -> {time.monotonic() - started:.1f}s: {spoken}")
 
     # ---- run -------------------------------------------------------------
 
-    def run(self) -> int:
+    def combo_labels(self) -> tuple[str, str]:
+        """(dictate, dictate+cleanup) hotkey strings for display."""
+        combo = "+".join([*self.cfg["hotkey"]["modifiers"], self.cfg["hotkey"]["key"]])
+        cleanup_combo = "+".join(
+            [*self.cfg["hotkey"]["modifiers"], self.cfg["hotkey"]["cleanup_modifier"],
+             self.cfg["hotkey"]["key"]]
+        )
+        return combo, cleanup_combo
+
+    def start_background(self, install_signals: bool = False) -> bool:
+        """Bring up server, mic, hotkeys and worker without blocking or looping.
+
+        Everything runs on its own thread (pynput listener, worker, PortAudio
+        callback), so the caller keeps its thread free — that's what lets the
+        menu-bar app own the main Cocoa run loop. `install_signals` is only safe
+        from the main thread, so the CLI sets it and the menu-bar app does not.
+        """
         # Without Accessibility the listener starts and simply never fires, which
         # looks identical to a broken hotkey. Refuse instead of pretending to work.
         if permissions.has_accessibility() is False:
             log("Accessibility permission missing — global hotkeys would never fire.")
             log(permissions.SETTINGS_HELP)
             log("run --doctor after granting it")
-            return 1
+            self.set_state("error")
+            return False
 
         if not self.ensure_server():
-            return 1
+            self.set_state("error")
+            return False
 
         self.mic = audio.MicStream(
             samplerate=self.cfg["audio"]["samplerate"],
@@ -188,9 +225,10 @@ class Daemon:
             self.mic.open()
         except Exception as exc:
             log(f"microphone unavailable: {exc}")
-            log("grant Microphone permission to this terminal in System Settings > Privacy")
+            log("grant Microphone permission in System Settings > Privacy > Microphone")
+            self.set_state("error")
             self.shutdown()
-            return 1
+            return False
 
         watcher = hotkeys.ComboWatcher(
             self.cfg["hotkey"]["modifiers"],
@@ -199,23 +237,27 @@ class Daemon:
         )
         self.listener = hotkeys.listen(watcher, self.on_event)
 
-        combo = "+".join([*self.cfg["hotkey"]["modifiers"], self.cfg["hotkey"]["key"]])
-        cleanup_combo = "+".join(
-            [*self.cfg["hotkey"]["modifiers"], self.cfg["hotkey"]["cleanup_modifier"],
-             self.cfg["hotkey"]["key"]]
-        )
+        if install_signals:
+            signal.signal(signal.SIGINT, self.shutdown)
+            signal.signal(signal.SIGTERM, self.shutdown)
+
+        self.worker = threading.Thread(target=self.work, daemon=True)
+        self.worker.start()
+
+        combo, cleanup_combo = self.combo_labels()
         log(f"ready — hold {combo} to dictate, {cleanup_combo} to dictate + clean up")
+        self.set_state("idle")
+        return True
+
+    def run(self) -> int:
+        if not self.start_background(install_signals=True):
+            self.shutdown()
+            return 1
         log("ctrl+c here to quit")
-
-        signal.signal(signal.SIGINT, self.shutdown)
-        signal.signal(signal.SIGTERM, self.shutdown)
-
-        worker = threading.Thread(target=self.work, daemon=True)
-        worker.start()
         try:
             while not self.stopping.is_set():
                 time.sleep(0.2)
-                if not self.listener.running:
+                if self.listener is not None and not self.listener.running:
                     log("hotkey listener died — is Accessibility permission granted?")
                     break
         finally:
