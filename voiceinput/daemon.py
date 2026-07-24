@@ -15,11 +15,21 @@ from pathlib import Path
 from . import audio, cleanup, config, hotkeys, inject, permissions, server, text, transcribe
 
 LOG_DIR = Path.home() / ".local" / "state" / "voice-input"
+# macOS-conventional app log. The .app (py2app) has no console, so a file sink is
+# the only way its state is observable; also shows up in Console.app.
+APP_LOG = Path.home() / "Library" / "Logs" / "voice-input.log"
 
 
 def log(message: str) -> None:
+    line = f"[voice-input] {message}"
     # stderr, so `--transcribe` can be piped without the chatter
-    print(f"[voice-input] {message}", file=sys.stderr, flush=True)
+    print(line, file=sys.stderr, flush=True)
+    try:
+        APP_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with APP_LOG.open("a") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
 
 
 def chime(cfg: dict, which: str) -> None:

@@ -1,85 +1,73 @@
 #!/usr/bin/env bash
-# Build voice-input.app — a real macOS bundle so TCC (Microphone / Accessibility)
-# attaches to *this app's identity* instead of to a terminal or a tmux server.
+# Build voice-input.app with py2app — a self-contained bundle whose own signed
+# executable loads Python in-process.
 #
-# It is a thin wrapper: the bundle's executable launches the repo venv running the
-# menu-bar app. Not self-contained (needs this repo + its .venv), which is exactly
-# right for a personal, single-machine tool — it sidesteps the py2app / native-ext
-# packaging swamp while still giving a stable, grantable app identity.
+# Why not a shell wrapper: a launcher that `exec`s Homebrew Python makes the running
+# process identity `org.python.python`, so a TCC (Accessibility / Microphone) grant
+# on the bundle never applies — proven the hard way. py2app's bootstrap IS the bundle
+# identity, so grants actually stick.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="$ROOT/.venv"
 PY="$VENV/bin/python"
 BUNDLE_ID="studio.arag.voice-input"
-APP_DEST="${1:-$HOME/Applications/voice-input.app}"
-VERSION="0.1.0"
+APP_DEST="${1:-/Applications/voice-input.app}"
 
 [[ -x "$PY" ]] || { echo "no venv at $VENV — run ./scripts/setup.sh first" >&2; exit 1; }
 
-# Install the package itself (non-editable) INTO the venv, with the menubar extra.
-# This is what makes the .app immune to which git branch the monorepo is on: the
-# launcher imports from site-packages, not from the working tree (whose source
-# disappears when another branch is checked out).
-echo "installing voice-input[menubar] into the venv…"
+echo "installing build deps (menubar + py2app)…"
 if command -v uv >/dev/null 2>&1; then
-  (cd "$ROOT" && uv pip install -q ".[menubar]")
+  (cd "$ROOT" && uv pip install -q ".[menubar]" py2app)
 else
-  (cd "$ROOT" && "$PY" -m pip install -q ".[menubar]")
+  (cd "$ROOT" && "$PY" -m pip install -q ".[menubar]" py2app)
 fi
 
-echo "building bundle at $APP_DEST"
-rm -rf "$APP_DEST"
-mkdir -p "$APP_DEST/Contents/MacOS" "$APP_DEST/Contents/Resources"
+echo "building with py2app…"
+cd "$ROOT"
+rm -rf build dist
+# py2app 0.28 errors on PEP 621 `[project]` metadata; hide pyproject for the build
+# (the package is already installed in the venv, so py2app doesn't need it). Always
+# restore it, even on failure.
+moved=0
+if [[ -f pyproject.toml ]]; then mv pyproject.toml .pyproject.toml.hidden; moved=1; fi
+restore() { [[ $moved -eq 1 && -f .pyproject.toml.hidden ]] && mv .pyproject.toml.hidden pyproject.toml; }
+trap restore EXIT
+"$PY" setup_app.py py2app >/dev/null
+restore; trap - EXIT
 
-# --- Info.plist ---------------------------------------------------------------
-# LSUIElement=1 keeps it out of the Dock (menu-bar only). NSMicrophoneUsageDescription
-# is mandatory — without it macOS kills the process instead of showing the mic prompt.
-cat > "$APP_DEST/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleName</key><string>voice-input</string>
-  <key>CFBundleDisplayName</key><string>Voice Input</string>
-  <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
-  <key>CFBundleExecutable</key><string>voice-input</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>$VERSION</string>
-  <key>CFBundleVersion</key><string>$VERSION</string>
-  <key>LSUIElement</key><true/>
-  <key>LSMinimumSystemVersion</key><string>12.0</string>
-  <key>NSMicrophoneUsageDescription</key>
-  <string>voice-input records your voice so it can be transcribed locally on this Mac.</string>
-</dict>
-</plist>
-PLIST
+[[ -d dist/voice-input.app ]] || { echo "py2app did not produce dist/voice-input.app" >&2; exit 1; }
 
-# --- launcher executable ------------------------------------------------------
-# Runs the venv python against the INSTALLED package (site-packages), so it does not
-# depend on the repo working tree being on any particular branch. App stdout/stderr
-# go to a user log for post-mortem.
-cat > "$APP_DEST/Contents/MacOS/voice-input" <<LAUNCH
-#!/bin/bash
-exec "$PY" -m voiceinput.menubar >> "\$HOME/Library/Logs/voice-input.log" 2>&1
-LAUNCH
-chmod +x "$APP_DEST/Contents/MacOS/voice-input"
-
-# --- ad-hoc code signature ----------------------------------------------------
-# A stable identifier lets TCC remember the grant. Ad-hoc (-) signing keys the
-# grant to the bundle's cdhash, so re-running this script changes the hash and you
-# may have to re-approve Microphone/Accessibility once. That is the price of not
-# paying for a Developer ID; documented in the README.
 echo "signing (ad-hoc, id=$BUNDLE_ID)…"
-codesign --force --deep --sign - --identifier "$BUNDLE_ID" "$APP_DEST"
-codesign --verify --deep --strict "$APP_DEST" && echo "signature OK"
+codesign --force --deep --sign - --identifier "$BUNDLE_ID" dist/voice-input.app
+codesign --verify --deep --strict dist/voice-input.app && echo "signature OK"
 
-# Register with LaunchServices so `open` finds it immediately.
+# Confirm the running-identity fix at build time: the executable must be the bundle,
+# not org.python.python.
+got_id=$(codesign -dvvv dist/voice-input.app/Contents/MacOS/voice-input 2>&1 | sed -n 's/^Identifier=//p')
+[[ "$got_id" == "$BUNDLE_ID" ]] || { echo "identity check FAILED: got '$got_id'" >&2; exit 1; }
+echo "executable identity = $got_id ✓"
+
+echo "installing to $APP_DEST"
+pkill -f "voice-input.app/Contents/MacOS" 2>/dev/null || true
+sleep 1
+rm -rf "$APP_DEST"
+if ! cp -R dist/voice-input.app "$APP_DEST" 2>/dev/null; then
+  echo "could not write $APP_DEST (permissions?) — leaving it in $ROOT/dist/voice-input.app" >&2
+  APP_DEST="$ROOT/dist/voice-input.app"
+fi
+
+# Fresh cdhash → clear any stale TCC grant for this id so the re-grant is clean.
+tccutil reset Accessibility "$BUNDLE_ID" >/dev/null 2>&1 || true
+tccutil reset Microphone "$BUNDLE_ID" >/dev/null 2>&1 || true
+tccutil reset ListenEvent "$BUNDLE_ID" >/dev/null 2>&1 || true
+
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
   -f "$APP_DEST" 2>/dev/null || true
 
 echo
-echo "built: $APP_DEST"
-echo "first launch:  open \"$APP_DEST\""
-echo "then grant Microphone + Accessibility to \"Voice Input\" when prompted (or in"
-echo "System Settings > Privacy & Security), and relaunch it once."
+echo "built + installed: $APP_DEST"
+echo "1) open \"$APP_DEST\""
+echo "2) grant Microphone + Accessibility to \"voice-input\" (System Settings > Privacy),"
+echo "   then quit + relaunch it once."
+echo "Do NOT move the bundle after granting — a move changes its signature and drops the grant."
