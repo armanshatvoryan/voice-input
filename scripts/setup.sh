@@ -19,12 +19,15 @@ if [[ ! -f "$MODEL" ]]; then
     https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin
 fi
 
+# Install the package itself (non-editable, with the menubar extra) rather than just
+# the requirements — the console entry points and the .app both import it from
+# site-packages, which keeps them working regardless of the current git branch.
 if command -v uv >/dev/null 2>&1; then
   uv venv --python 3.13 .venv
-  uv pip install -r requirements.txt
+  uv pip install ".[menubar]"
 else
   python3 -m venv .venv
-  ./.venv/bin/pip install -q -r requirements.txt
+  ./.venv/bin/pip install -q ".[menubar]"
 fi
 
 echo

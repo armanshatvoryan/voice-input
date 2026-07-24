@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: voice-input
+Version: 0.1.0
+Summary: Hold a hotkey, speak, get text at the cursor. Local whisper.cpp, no cloud.
+Requires-Python: >=3.11
+Requires-Dist: numpy>=2.0
+Requires-Dist: sounddevice>=0.4.6
+Requires-Dist: pynput>=1.7.7
+Provides-Extra: menubar
+Requires-Dist: rumps>=0.4; extra == "menubar"

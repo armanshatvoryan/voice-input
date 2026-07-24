@@ -17,11 +17,15 @@ VERSION="0.1.0"
 
 [[ -x "$PY" ]] || { echo "no venv at $VENV — run ./scripts/setup.sh first" >&2; exit 1; }
 
-echo "ensuring rumps is installed…"
+# Install the package itself (non-editable) INTO the venv, with the menubar extra.
+# This is what makes the .app immune to which git branch the monorepo is on: the
+# launcher imports from site-packages, not from the working tree (whose source
+# disappears when another branch is checked out).
+echo "installing voice-input[menubar] into the venv…"
 if command -v uv >/dev/null 2>&1; then
-  (cd "$ROOT" && uv pip install -q rumps)
+  (cd "$ROOT" && uv pip install -q ".[menubar]")
 else
-  "$PY" -m pip install -q rumps
+  (cd "$ROOT" && "$PY" -m pip install -q ".[menubar]")
 fi
 
 echo "building bundle at $APP_DEST"
@@ -52,11 +56,11 @@ cat > "$APP_DEST/Contents/Info.plist" <<PLIST
 PLIST
 
 # --- launcher executable ------------------------------------------------------
-# Runs the venv python against the repo (via PYTHONPATH, no install step needed).
-# App stdout/stderr go to a user log for post-mortem.
+# Runs the venv python against the INSTALLED package (site-packages), so it does not
+# depend on the repo working tree being on any particular branch. App stdout/stderr
+# go to a user log for post-mortem.
 cat > "$APP_DEST/Contents/MacOS/voice-input" <<LAUNCH
 #!/bin/bash
-export PYTHONPATH="$ROOT\${PYTHONPATH:+:\$PYTHONPATH}"
 exec "$PY" -m voiceinput.menubar >> "\$HOME/Library/Logs/voice-input.log" 2>&1
 LAUNCH
 chmod +x "$APP_DEST/Contents/MacOS/voice-input"

@@ -5,8 +5,13 @@ description = "Hold a hotkey, speak, get text at the cursor. Local whisper.cpp, 
 requires-python = ">=3.11"
 dependencies = ["numpy>=2.0", "sounddevice>=0.4.6", "pynput>=1.7.7"]
 
+[project.optional-dependencies]
+# Menu-bar .app front end (build_app.sh). CLI-only users don't need it.
+menubar = ["rumps>=0.4"]
+
 [project.scripts]
 voice-input = "voiceinput.daemon:main"
+voice-input-menubar = "voiceinput.menubar:main"
 
 [build-system]
 requires = ["setuptools>=68"]
