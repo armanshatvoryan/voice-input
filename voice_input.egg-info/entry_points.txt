@@ -1,3 +1,0 @@
-[console_scripts]
-voice-input = voiceinput.daemon:main
-voice-input-menubar = voiceinput.menubar:main

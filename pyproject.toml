@@ -8,6 +8,8 @@ dependencies = ["numpy>=2.0", "sounddevice>=0.4.6", "pynput>=1.7.7"]
 [project.optional-dependencies]
 # Menu-bar .app front end (build_app.sh). CLI-only users don't need it.
 menubar = ["rumps>=0.4"]
+# Test tooling — `pip install .[dev]` to run pytest.
+dev = ["pytest>=8"]
 
 [project.scripts]
 voice-input = "voiceinput.daemon:main"
