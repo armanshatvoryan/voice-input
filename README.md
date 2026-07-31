@@ -5,17 +5,20 @@ focused. Runs entirely on-device via `whisper.cpp`. No API key, no cloud, no
 per-minute cost.
 
 ```
-HOLD  ctrl+alt+space  ──────────────►  release
-        [recording]                    [whisper]
-                                            ↓
-                                   pasted at the cursor
+HOLD  right-⌥  ─────────────────────►  release
+      [mic opens]                      [final whisper decode]
+      live transcript in a HUD              ↓
+      while you hold                 pasted at the cursor
 ```
 
-- **`ctrl+alt+space`** — dictate, paste the transcript verbatim.
-- **`ctrl+alt+shift+space`** — dictate, then run it through `claude -p` to fix
-  punctuation and drop filler before pasting (+2–4s).
+- **Hold right-Option (⌥)** — dictate; a floating HUD shows a live transcript as you
+  speak, and the accurate final text is pasted when you release.
+- **Right-Option + Shift** — same, then run it through `claude -p` to fix punctuation
+  and drop filler before pasting (+2–4s).
 
 Auto-detects language per utterance. English and Russian both verified verbatim.
+The left Option key is left alone, so you can still type special characters with it.
+Prefer a chord? Set `[hotkey] modifiers = ["ctrl","alt"]`, `key = "space"`.
 
 ## Setup
 
@@ -101,14 +104,27 @@ bundle's code hash, so re-running `build_app.sh` changes the hash and you may ha
 re-approve Microphone / Accessibility **once**. A Developer ID signature would make the
 grant survive rebuilds; not worth it for a personal tool.
 
+## Live preview (the HUD)
+
+While you hold the key, a small caption bar at the bottom-center of the screen shows
+a running transcript so you can *see* what's being heard. This is driven by a second,
+smaller whisper model on its own server (`ggml-small`, port 8179) that decodes the
+audio-so-far every ~400ms — fast enough to feel live, readable enough to trust. On
+release, the **large** model does one accurate full re-decode and *that* is what gets
+pasted; the partials are feedback only, never the final text.
+
+Turn it off with `[preview] enabled = false` (one server, no HUD). `ggml-base` is
+2× faster for partials but garbles words, so `small` is the default; if the preview
+model is missing the app just disables the HUD and dictation still works.
+
 ## How it works
 
-- **Always-open mic stream.** The input device is opened once at startup, not per
-  utterance, so pressing the hotkey costs no device-open delay. A 400ms ring buffer
-  runs continuously and is prepended to each take, so the syllable you started
-  before the key registered is still there.
+- **On-demand mic.** The input device is opened when you press the key and closed when
+  you release, so the mic is genuinely off (no recording indicator) between takes.
+  Cost is ~100–200ms of open latency — press, then start speaking a beat later.
 - **Persistent server.** A cold `whisper-cli` pays ~2s of model load (plus a one-off
-  ~15s Metal shader compile) *per utterance*. One warm server pays it once.
+  ~15s Metal shader compile) *per utterance*. One warm server pays it once. Both the
+  large (final) and small (preview) servers stay hot for the life of the daemon.
 - **Clipboard paste, not synthetic typing.** One event instead of hundreds, and it
   survives Armenian/Russian text that per-character injection mangles under
   non-US layouts. Your previous clipboard is restored afterwards, unless you copied
@@ -165,9 +181,11 @@ redoes the take at full context if whisper stutters.
 
 ```
 voiceinput/
-  daemon.py       wiring, CLI, --doctor
-  audio.py        always-open mic stream + pre-roll ring buffer
-  hotkeys.py      hold-to-talk state machine (pure) + pynput adapter
+  daemon.py       wiring, dual-server boot, CLI, --doctor, PATH augmentation
+  audio.py        on-demand mic capture + snapshot() for live preview
+  hotkeys.py      hold-to-talk state machine (side-specific keys) + pynput adapter
+  streaming.py    live-preview loop (sample → fast decode → emit), pure + testable
+  hud.py          floating caption panel (AppKit, non-activating)
   transcribe.py   whisper-server HTTP client
   text.py         artifact stripping, repetition-loop detection
   inject.py       clipboard + ⌘V
@@ -176,7 +194,7 @@ voiceinput/
   server.py       whisper-server lifecycle
 ```
 
-`pytest` — 54 tests, all pure logic (no mic, no server, no permissions needed).
+`pytest` — 74 tests, all pure logic (no mic, no server, no permissions needed).
 
 ## Troubleshooting
 
@@ -186,8 +204,12 @@ actual peak sample; 0 means the grant is missing.
 **Hotkey does nothing.** Accessibility, granted to the terminal app, then fully quit
 and reopen it.
 
-**`ctrl+alt+space` collides with something.** Change `[hotkey] modifiers` / `key`.
-The combo is not suppressed, so it also reaches the focused app.
+**The hotkey collides with something.** Change `[hotkey] modifiers` / `key`. Right
+option reports as `alt_r` (some layouts `alt_gr`); both count as the right side.
+
+**No live HUD while holding.** The preview model (`ggml-small`) is missing or
+`[preview] enabled = false`. `--doctor` shows whether the preview model is found;
+dictation works either way.
 
 **Armenian is poor.** Expected — whisper's Armenian WER is high. Russian and English
 are solid.

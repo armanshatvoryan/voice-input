@@ -12,12 +12,29 @@ import time
 import wave
 from pathlib import Path
 
-from . import audio, cleanup, config, hotkeys, inject, permissions, server, text, transcribe
+from . import (
+    audio, cleanup, config, hotkeys, inject, permissions, server, streaming, text,
+    transcribe,
+)
 
 LOG_DIR = Path.home() / ".local" / "state" / "voice-input"
 # macOS-conventional app log. The .app (py2app) has no console, so a file sink is
 # the only way its state is observable; also shows up in Console.app.
 APP_LOG = Path.home() / "Library" / "Logs" / "voice-input.log"
+
+
+def augment_path() -> None:
+    """A .app launched via `open` inherits a minimal PATH (/usr/bin:/bin:…) without
+    Homebrew, so `whisper-server` and `claude` aren't found. Prepend the dirs they
+    live in, once, so shutil.which/subprocess resolve them from inside the bundle."""
+    import os
+
+    extra = ["/opt/homebrew/bin", "/usr/local/bin", str(Path.home() / ".local" / "bin")]
+    parts = os.environ.get("PATH", "").split(os.pathsep)
+    for directory in reversed(extra):
+        if directory not in parts:
+            parts.insert(0, directory)
+    os.environ["PATH"] = os.pathsep.join(parts)
 
 
 def log(message: str) -> None:
@@ -46,7 +63,8 @@ def chime(cfg: dict, which: str) -> None:
 
 
 class Daemon:
-    def __init__(self, cfg: dict, spawn_server: bool = True, on_status=None):
+    def __init__(self, cfg: dict, spawn_server: bool = True, on_status=None,
+                 on_partial=None):
         self.cfg = cfg
         self.spawn_server = spawn_server and cfg["server"]["spawn"]
         self.url = config.server_url(cfg)
@@ -61,6 +79,14 @@ class Daemon:
         # write is atomic under the GIL, so threads can set it without a lock.
         self.state = "starting"
         self.on_status = on_status
+        self.on_partial = on_partial
+        # Live-preview state, polled by the HUD. Atomic-string writes, no lock.
+        self.partial_text = ""
+        self.preview_url: str | None = None
+        self.preview_enabled = False
+        self.preview_proc: subprocess.Popen | None = None
+        self.preview_stop: threading.Event | None = None
+        self.preview_thread: threading.Thread | None = None
 
     def set_state(self, state: str) -> None:
         self.state = state
@@ -96,35 +122,138 @@ class Daemon:
         log(f"whisper-server ready at {self.url}")
         return True
 
+    def ensure_preview_server(self) -> bool:
+        """Bring up the small fast model on its own port for live partials.
+
+        Best-effort: if the preview model is missing or the server won't start,
+        live preview is silently disabled and dictation still works fully.
+        """
+        if not self.cfg["preview"]["enabled"]:
+            return False
+        view = config.preview_server_cfg(self.cfg)
+        model = config.model_path(view)
+        url = config.server_url(view)
+        if not model.is_file():
+            log(f"preview model not found ({model}); live preview disabled")
+            return False
+        if server.is_up(url):
+            self.preview_url = url
+            return True
+        if not self.spawn_server:
+            log("no preview whisper-server and spawning disabled; live preview off")
+            return False
+        log_path = LOG_DIR / "whisper-server-preview.log"
+        log(f"starting preview whisper-server ({model.name})")
+        self.preview_proc = server.spawn(view, log_path)
+        if not server.wait_until_up(url, view["server"]["startup_timeout_s"],
+                                    self.preview_proc):
+            log("preview whisper-server failed to come up; live preview disabled")
+            return False
+        self.preview_url = url
+        log(f"preview whisper-server ready at {url}")
+        return True
+
     def shutdown(self, *_args) -> None:
         if self.stopping.is_set():
             return
         self.stopping.set()
         log("shutting down")
+        self.stop_preview()
         if self.listener is not None:
             self.listener.stop()
         if self.mic is not None:
             self.mic.close()
-        if self.server_proc is not None:
-            self.server_proc.terminate()
-            try:
-                self.server_proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.server_proc.kill()
+        for proc in (self.server_proc, self.preview_proc):
+            if proc is not None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
         self.state = "stopped"
+
+    # ---- live preview ----------------------------------------------------
+
+    def preview_decode(self, pcm) -> str:
+        """Fast partial transcript from the preview (base) model."""
+        wav = audio.to_wav(pcm, self.cfg["audio"]["samplerate"])
+        raw = transcribe.transcribe(
+            wav, self.preview_url, language=self.cfg["language"],
+            audio_ctx=transcribe.FULL_CONTEXT, timeout=15,
+        )
+        return text.clean(raw)
+
+    def emit_partial(self, partial: str) -> None:
+        # A preview thread that outlived its join timeout may still emit one late
+        # partial; only accept them while an actual take is in progress.
+        if self.state != "recording":
+            return
+        self.partial_text = partial
+        if self.on_partial is not None:
+            try:
+                self.on_partial(partial)
+            except Exception:
+                pass
+
+    def start_preview(self) -> None:
+        if not self.preview_enabled:
+            return
+        # Reap a previous thread that outlived its stop_preview() join timeout,
+        # so two streamers never run at once.
+        if self.preview_thread is not None and self.preview_thread.is_alive():
+            self.preview_thread.join(timeout=2.0)
+        self.preview_stop = threading.Event()
+        streamer = streaming.PreviewStreamer(
+            snapshot=self.mic.snapshot,
+            decode=self.preview_decode,
+            emit=self.emit_partial,
+            interval_ms=self.cfg["preview"]["interval_ms"],
+            samplerate=self.cfg["audio"]["samplerate"],
+        )
+        self.preview_thread = threading.Thread(
+            target=streamer.run, args=(self.preview_stop,), daemon=True
+        )
+        self.preview_thread.start()
+
+    def stop_preview(self) -> None:
+        if self.preview_stop is not None:
+            self.preview_stop.set()
+        if self.preview_thread is not None:
+            self.preview_thread.join(timeout=1.0)
+            if self.preview_thread.is_alive():
+                # Still mid-decode; keep the reference so start_preview can reap it.
+                self.preview_stop = None
+                return
+        self.preview_thread = None
+        self.preview_stop = None
 
     # ---- hotkey events ---------------------------------------------------
 
     def on_event(self, event: str) -> None:
-        if event in (hotkeys.START, hotkeys.START_CLEANUP):
-            self.mode = "cleanup" if event == hotkeys.START_CLEANUP else "raw"
-            self.mic.start()
-            chime(self.cfg, "start")
-            self.set_state("recording")
-            log(f"recording ({self.mode})…")
-        elif event == hotkeys.STOP:
-            pcm = self.mic.stop()
-            self.jobs.put((pcm, self.mode))
+        # Guarded: this runs on the pynput listener thread; an escaped exception
+        # would kill hotkey handling for the rest of the session.
+        try:
+            if event in (hotkeys.START, hotkeys.START_CLEANUP):
+                self.mode = "cleanup" if event == hotkeys.START_CLEANUP else "raw"
+                self.partial_text = ""
+                self.set_state("recording")
+                self.mic.start()               # on-demand: opens the mic now
+                self.start_preview()
+                chime(self.cfg, "start")
+                log(f"recording ({self.mode})…")
+            elif event == hotkeys.STOP:
+                self.stop_preview()
+                pcm = self.mic.stop()          # closes the mic
+                self.jobs.put((pcm, self.mode))
+            elif event == hotkeys.CANCEL:
+                self.stop_preview()
+                self.mic.stop()                # discard the take
+                self.set_state("idle")
+                log("cancelled — nothing pasted")
+        except Exception as exc:
+            chime(self.cfg, "error")
+            self.set_state("error")
+            log(f"recording error: {exc}")
 
     # ---- worker ----------------------------------------------------------
 
@@ -164,6 +293,7 @@ class Daemon:
         sr = self.cfg["audio"]["samplerate"]
         length = audio.duration_ms(pcm, sr)
         if length < self.cfg["audio"]["min_ms"]:
+            self.set_state("idle")   # else the HUD, which mirrors state, never hides
             log(f"ignored {length:.0f}ms tap")
             return
 
@@ -197,12 +327,10 @@ class Daemon:
 
     def combo_labels(self) -> tuple[str, str]:
         """(dictate, dictate+cleanup) hotkey strings for display."""
-        combo = "+".join([*self.cfg["hotkey"]["modifiers"], self.cfg["hotkey"]["key"]])
-        cleanup_combo = "+".join(
-            [*self.cfg["hotkey"]["modifiers"], self.cfg["hotkey"]["cleanup_modifier"],
-             self.cfg["hotkey"]["key"]]
-        )
-        return combo, cleanup_combo
+        hk = self.cfg["hotkey"]
+        dictate = hotkeys.describe(hk["modifiers"], hk["key"])
+        cleanup = hotkeys.describe(hk["modifiers"], hk["key"], hk["cleanup_modifier"])
+        return dictate, cleanup
 
     def start_background(self, install_signals: bool = False) -> bool:
         """Bring up server, mic, hotkeys and worker without blocking or looping.
@@ -225,14 +353,15 @@ class Daemon:
             self.set_state("error")
             return False
 
+        self.preview_enabled = self.ensure_preview_server()
+
         self.mic = audio.MicStream(
             samplerate=self.cfg["audio"]["samplerate"],
             device=self.cfg["audio"]["device"],
-            preroll_ms=self.cfg["audio"]["preroll_ms"],
             max_s=self.cfg["audio"]["max_s"],
         )
         try:
-            self.mic.open()
+            self.mic.probe()   # opens+closes once to raise the mic-permission prompt early
         except Exception as exc:
             log(f"microphone unavailable: {exc}")
             log("grant Microphone permission in System Settings > Privacy > Microphone")
@@ -244,6 +373,7 @@ class Daemon:
             self.cfg["hotkey"]["modifiers"],
             self.cfg["hotkey"]["key"],
             self.cfg["hotkey"]["cleanup_modifier"],
+            cancel_key=self.cfg["hotkey"].get("cancel_key", "backspace"),
         )
         self.listener = hotkeys.listen(watcher, self.on_event)
 
@@ -290,6 +420,10 @@ def doctor(cfg: dict) -> int:
 
     model = config.model_path(cfg)
     report("whisper model", model.is_file(), str(model))
+    if cfg["preview"]["enabled"]:
+        pv_model = config.model_path(config.preview_server_cfg(cfg))
+        report("preview model (live HUD)", pv_model.is_file(),
+               str(pv_model) + ("" if pv_model.is_file() else ", live preview disabled"))
     report("whisper-server binary", shutil.which(cfg["server"]["binary"]) is not None)
     report("clipboard tools", all(shutil.which(t) for t in ("pbcopy", "pbpaste")))
     report("claude CLI (cleanup hotkey)", shutil.which(cfg["cleanup"]["claude_bin"]) is not None,
@@ -344,6 +478,7 @@ def transcribe_file(path: str, cfg: dict, spawn_server: bool) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    augment_path()
     parser = argparse.ArgumentParser(prog="voice-input", description=__doc__)
     parser.add_argument("--no-spawn", action="store_true",
                         help="use an already-running whisper-server instead of starting one")

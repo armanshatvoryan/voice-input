@@ -15,7 +15,6 @@ threads = 4
 [audio]
 # device = 1               # index from `voice-input --list-devices`; omit for system default
 samplerate = 16000
-preroll_ms = 400           # audio kept from before the hotkey registered
 min_ms = 300               # anything shorter is treated as an accidental tap
 max_s = 180
 # Encoder context. 0 = full 30s window: always correct, ~2.2s per utterance.
@@ -24,11 +23,29 @@ max_s = 180
 # measured safe here, and anything longer than the value covers is auto-promoted to
 # full. Leave at 0 unless you dictate only short bursts and have verified the result.
 context = 0
+# Mic is opened only while the key is held (on-demand) — off when idle, no preroll.
 
 [hotkey]
-modifiers = ["ctrl", "alt"]
-key = "space"
-cleanup_modifier = "shift" # ctrl+alt+shift+space = transcribe, then tidy via claude -p
+# Hold right-option (⌥ right) to dictate; right-option + shift = transcribe then
+# tidy via `claude -p`. `alt_r` is side-specific — the left option stays free for
+# typing special characters. Back to a chord: modifiers = ["ctrl","alt"], key = "space".
+modifiers = []
+key = "alt_r"
+cleanup_modifier = "shift"
+cancel_key = "backspace"   # pressed mid-hold: abort the take, paste nothing (esc collides with Force Quit)
+
+[preview]
+# Live transcript in a floating HUD while you hold the key. A fast model on its own
+# whisper-server drives the partials; the large model still does the accurate final
+# paste on release. Set enabled = false to dictate with no live preview (one server).
+enabled = true
+# small = readable live partials + correct language auto-detect (~0.5-1s per decode).
+# ggml-base is ~2x faster but garbles words, so it is not the default. The large model
+# still does the accurate final paste on release regardless of this.
+model = "~/.cache/whisper-cpp/ggml-small.bin"
+port = 8179
+interval_ms = 400          # target refresh; loop stretches if a decode takes longer
+threads = 4
 
 [inject]
 restore_clipboard = true

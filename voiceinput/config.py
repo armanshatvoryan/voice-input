@@ -25,15 +25,29 @@ DEFAULTS: dict[str, Any] = {
     "audio": {
         "device": None,          # None = system default input
         "samplerate": 16000,
-        "preroll_ms": 400,       # audio kept from *before* the hotkey landed
         "min_ms": 300,           # shorter than this = treated as an accidental tap
         "max_s": 180,
         "context": 0,            # whisper audio_ctx; 0 = full window. See README.
     },
     "hotkey": {
-        "modifiers": ["ctrl", "alt"],
-        "key": "space",
+        # Hold right-option to dictate; right-option + shift = dictate then tidy.
+        # `alt_r` is side-specific: the left option key is left free for typing.
+        "modifiers": [],
+        "key": "alt_r",
         "cleanup_modifier": "shift",
+        "cancel_key": "backspace",  # pressed mid-hold: abort the take, paste nothing
+    },
+    "preview": {
+        # Live transcript shown in a floating HUD while you hold the key. A small,
+        # fast model on its own whisper-server drives the partials; the accurate
+        # large model still does the final paste on release.
+        "enabled": True,
+        # small = readable partials + correct language auto-detect, ~0.5-1s/decode.
+        # base is ~2x faster but garbles words (measured), so it's not the default.
+        "model": "~/.cache/whisper-cpp/ggml-small.bin",
+        "port": 8179,
+        "interval_ms": 400,      # target refresh; the loop stretches if a decode runs longer
+        "threads": 4,
     },
     "inject": {
         "restore_clipboard": True,
@@ -94,3 +108,17 @@ def model_path(cfg: dict) -> Path:
 
 def server_url(cfg: dict) -> str:
     return f"http://{cfg['server']['host']}:{cfg['server']['port']}"
+
+
+def preview_server_cfg(cfg: dict) -> dict:
+    """A cfg-shaped view pointing at the preview model + port, so the same
+    server/ helpers spawn and reach the second (fast) whisper-server."""
+    pv = cfg["preview"]
+    view = copy.deepcopy(cfg)
+    view["model"] = pv["model"]
+    view["server"] = {**cfg["server"], "port": pv["port"], "threads": pv["threads"]}
+    return view
+
+
+def preview_url(cfg: dict) -> str:
+    return f"http://{cfg['server']['host']}:{cfg['preview']['port']}"

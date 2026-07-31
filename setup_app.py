@@ -19,7 +19,13 @@ OPTIONS = {
     "packages": ["voiceinput", "rumps", "sounddevice", "pynput", "numpy"],
     # sounddevice dlopens PortAudio at runtime; ship the wheel's copy so the app
     # doesn't depend on a Homebrew install being present.
-    "includes": ["_sounddevice_data"],
+    # AppKit/Foundation (HUD) and Quartz/ApplicationServices (permission probes) are
+    # imported lazily *inside functions*, which py2app's static scanner misses — list
+    # them so the bundle actually contains them.
+    "includes": [
+        "_sounddevice_data",
+        "AppKit", "Foundation", "Quartz", "ApplicationServices",
+    ],
     "plist": {
         "CFBundleName": "voice-input",
         "CFBundleDisplayName": "Voice Input",

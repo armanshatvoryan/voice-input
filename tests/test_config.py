@@ -33,7 +33,21 @@ def test_missing_file_is_ignored(tmp_path: Path):
 def test_repo_config_parses_and_matches_defaults():
     cfg = config.load(paths=[config.REPO_CONFIG])
     assert cfg["server"]["port"] == config.DEFAULTS["server"]["port"]
-    assert cfg["hotkey"]["key"] == "space"
+    assert cfg["hotkey"]["key"] == "alt_r"          # right-option default
+    assert cfg["hotkey"]["modifiers"] == []
+
+
+def test_preview_server_cfg_swaps_model_and_port():
+    cfg = config.load(paths=[])
+    view = config.preview_server_cfg(cfg)
+    assert view["server"]["port"] == cfg["preview"]["port"]
+    assert view["model"] == cfg["preview"]["model"]
+    assert view["server"]["host"] == cfg["server"]["host"]   # host/binary unchanged
+    assert cfg["model"] != view["model"]                     # original untouched
+
+
+def test_preview_url():
+    assert config.preview_url(config.load(paths=[])) == "http://127.0.0.1:8179"
 
 
 def test_model_path_expands_home():

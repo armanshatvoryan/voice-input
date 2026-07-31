@@ -49,11 +49,10 @@ def microphone_peak(cfg: dict, seconds: float = 1.5) -> int:
     from .audio import MicStream
 
     mic = MicStream(samplerate=cfg["audio"]["samplerate"], device=cfg["audio"]["device"])
-    mic.open()
     try:
-        mic.start()
+        mic.start()          # on-demand: start() opens the device
         time.sleep(seconds)
-        pcm = mic.stop()
+        pcm = mic.stop()     # and stop() closes it
     finally:
         mic.close()
     return int(np.abs(pcm).max()) if len(pcm) else 0

@@ -15,7 +15,7 @@ import threading
 
 import rumps
 
-from . import config, permissions
+from . import config, hotkeys, hud
 from .daemon import Daemon, doctor
 
 # Menu-bar glyph per daemon state. Kept to a single character — the menu bar is
@@ -45,10 +45,12 @@ class VoiceInputApp(rumps.App):
         self.cfg = config.load()
         self.daemon: Daemon | None = None
         self._last_state = None
+        self.hud = hud.CaptionHUD()
+        self._hud_visible = False
 
         hk = self.cfg["hotkey"]
-        combo = "+".join([*hk["modifiers"], hk["key"]])
-        cleanup_combo = "+".join([*hk["modifiers"], hk["cleanup_modifier"], hk["key"]])
+        combo = hotkeys.describe(hk["modifiers"], hk["key"])
+        cleanup_combo = hotkeys.describe(hk["modifiers"], hk["key"], hk["cleanup_modifier"])
 
         self.status_item = rumps.MenuItem("Starting…")
         self.status_item.set_callback(None)  # non-clickable status line
@@ -87,6 +89,23 @@ class VoiceInputApp(rumps.App):
         self.title = GLYPH.get(state, "🎙")
         self.status_item.title = STATE_LABEL.get(state, state)
 
+    # The HUD is AppKit; this timer runs on the main Cocoa thread, so it is the only
+    # safe place to touch the panel. It just mirrors the daemon's live-preview state,
+    # which the daemon writes from its own threads (plain string/bool, no lock).
+    @rumps.timer(0.12)
+    def _preview(self, _timer) -> None:
+        d = self.daemon
+        want = bool(d and d.preview_enabled and d.state in ("recording", "working"))
+        if want:
+            if not self._hud_visible:
+                self.hud.show(d.partial_text)
+                self._hud_visible = True
+            else:
+                self.hud.update(d.partial_text)
+        elif self._hud_visible:
+            self.hud.hide()
+            self._hud_visible = False
+
     # ---- menu actions ----------------------------------------------------
 
     def on_restart(self, _sender) -> None:
@@ -119,6 +138,9 @@ class VoiceInputApp(rumps.App):
 
 
 def main() -> int:
+    from .daemon import augment_path
+
+    augment_path()   # .app PATH lacks Homebrew; needed before spawning whisper-server
     VoiceInputApp().run()
     return 0
 

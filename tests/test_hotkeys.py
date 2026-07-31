@@ -1,8 +1,13 @@
-from voiceinput.hotkeys import START, START_CLEANUP, STOP, ComboWatcher
+from voiceinput.hotkeys import CANCEL, START, START_CLEANUP, STOP, ComboWatcher, describe
 
 
 def watcher():
     return ComboWatcher(["ctrl", "alt"], "space", "shift")
+
+
+def right_option():
+    """The new default: hold right-option alone, right-option+shift = cleanup."""
+    return ComboWatcher([], "alt_r", "shift")
 
 
 def test_full_combo_starts_and_release_stops():
@@ -89,3 +94,68 @@ def test_reset_clears_state():
     w.reset()
     assert not w.active
     assert w.press("space") is None
+
+
+# ---- right-option (side-specific) default -------------------------------
+
+def test_right_option_alone_starts_and_release_stops():
+    w = right_option()
+    assert w.press("alt_r") == START
+    assert w.release("alt_r") == STOP
+
+
+def test_left_option_does_not_trigger_right_option_hotkey():
+    # left option is used for typing special chars; it must NOT fire dictation.
+    w = right_option()
+    assert w.press("alt_l") is None
+    assert w.release("alt_l") is None
+    assert not w.active
+
+
+def test_alt_gr_counts_as_right_option():
+    # some layouts report the right option key as alt_gr.
+    w = right_option()
+    assert w.press("alt_gr") == START
+    assert w.release("alt_gr") == STOP
+
+
+def test_right_option_plus_shift_is_cleanup():
+    w = right_option()
+    assert w.press("shift_l") is None
+    assert w.press("alt_r") == START_CLEANUP
+    assert w.release("shift_l") is None      # letting go of shift must not truncate
+    assert w.release("alt_r") == STOP
+
+
+def test_generic_alt_still_matches_either_side():
+    # backward-compat: a combo asking for generic "alt" accepts left OR right.
+    w = ComboWatcher(["alt"], "space")
+    assert w.press("alt_r") is None
+    assert w.press("space") == START
+
+
+def test_describe_renders_symbols():
+    assert describe([], "alt_r") == "⌥ (right)"
+    assert describe(["shift"], "alt_r") == "⇧ + ⌥ (right)"
+    assert describe(["ctrl", "alt"], "space") == "⌃ + ⌥ + Space"
+
+
+def test_backspace_mid_hold_cancels():
+    w = right_option()
+    assert w.press("alt_r") == START
+    assert w.press("backspace") == CANCEL
+    assert not w.active
+    assert w.release("alt_r") is None        # releasing after a cancel is a no-op
+
+
+def test_backspace_when_idle_does_nothing():
+    w = right_option()
+    assert w.press("backspace") is None
+    assert w.press("alt_r") == START         # a fresh hold still works after stray backspace
+
+
+def test_cancel_key_configurable():
+    w = ComboWatcher([], "alt_r", "shift", cancel_key=None)
+    assert w.press("alt_r") == START
+    assert w.press("backspace") is None      # cancel disabled
+    assert w.release("alt_r") == STOP
