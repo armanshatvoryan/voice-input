@@ -90,6 +90,12 @@ class Daemon:
         self.preview_proc: subprocess.Popen | None = None
         self.preview_stop: threading.Event | None = None
         self.preview_thread: threading.Thread | None = None
+        # Two threads can end the same take (the release watchdog and a key-up that
+        # arrives late), so both the teardown claim and the preview thread handover
+        # have to be serialised.
+        self._take_lock = threading.Lock()
+        self._take_ending = False
+        self._preview_lock = threading.Lock()
 
     def set_state(self, state: str) -> None:
         self.state = state
@@ -205,34 +211,40 @@ class Daemon:
     def start_preview(self) -> None:
         if not self.preview_enabled:
             return
-        # Reap a previous thread that outlived its stop_preview() join timeout,
-        # so two streamers never run at once.
-        if self.preview_thread is not None and self.preview_thread.is_alive():
-            self.preview_thread.join(timeout=2.0)
-        self.preview_stop = threading.Event()
-        streamer = streaming.PreviewStreamer(
-            snapshot=self.mic.snapshot,
-            decode=self.preview_decode,
-            emit=self.emit_partial,
-            interval_ms=self.cfg["preview"]["interval_ms"],
-            samplerate=self.cfg["audio"]["samplerate"],
-        )
-        self.preview_thread = threading.Thread(
-            target=streamer.run, args=(self.preview_stop,), daemon=True
-        )
-        self.preview_thread.start()
+        with self._preview_lock:
+            # Reap a previous thread that outlived its stop_preview() join timeout,
+            # so two streamers never run at once.
+            previous = self.preview_thread
+            if previous is not None and previous.is_alive():
+                previous.join(timeout=2.0)
+            self.preview_stop = threading.Event()
+            streamer = streaming.PreviewStreamer(
+                snapshot=self.mic.snapshot,
+                decode=self.preview_decode,
+                emit=self.emit_partial,
+                interval_ms=self.cfg["preview"]["interval_ms"],
+                samplerate=self.cfg["audio"]["samplerate"],
+            )
+            self.preview_thread = threading.Thread(
+                target=streamer.run, args=(self.preview_stop,), daemon=True
+            )
+            self.preview_thread.start()
 
     def stop_preview(self) -> None:
-        if self.preview_stop is not None:
-            self.preview_stop.set()
-        if self.preview_thread is not None:
-            self.preview_thread.join(timeout=1.0)
-            if self.preview_thread.is_alive():
-                # Still mid-decode; keep the reference so start_preview can reap it.
-                self.preview_stop = None
-                return
-        self.preview_thread = None
-        self.preview_stop = None
+        # Locked and read through a local: a second thread ending the same take must
+        # not clear preview_thread while this one is parked in join().
+        with self._preview_lock:
+            if self.preview_stop is not None:
+                self.preview_stop.set()
+            thread = self.preview_thread
+            if thread is not None:
+                thread.join(timeout=1.0)
+                if thread.is_alive():
+                    # Still mid-decode; keep the reference so start_preview can reap it.
+                    self.preview_stop = None
+                    return
+            self.preview_thread = None
+            self.preview_stop = None
 
     # ---- release watchdog ------------------------------------------------
 
@@ -274,6 +286,21 @@ class Daemon:
 
     # ---- hotkey events ---------------------------------------------------
 
+    def claim_take_end(self) -> bool:
+        """True for the first STOP/CANCEL of a take, False for every duplicate.
+
+        The watchdog and a key-up that merely arrived late both deliver STOP, so two
+        threads used to tear down the same take: the loser stopped an already-stopped
+        mic and queued an empty take (the phantom "ignored 0ms tap"), and could
+        re-enter stop_preview() while the winner was parked in join() — which raised
+        "'NoneType' object has no attribute 'is_alive'" and failed the whole take.
+        """
+        with self._take_lock:
+            if self._take_ending or self.state != "recording":
+                return False
+            self._take_ending = True
+            return True
+
     def on_event(self, event: str) -> None:
         # Guarded: this runs on the pynput listener thread; an escaped exception
         # would kill hotkey handling for the rest of the session.
@@ -281,6 +308,8 @@ class Daemon:
             if event in (hotkeys.START, hotkeys.START_CLEANUP):
                 self.mode = "cleanup" if event == hotkeys.START_CLEANUP else "raw"
                 self.partial_text = ""
+                with self._take_lock:
+                    self._take_ending = False
                 self.set_state("recording")
                 self.mic.start()               # on-demand: opens the mic now
                 self.start_preview()
@@ -288,10 +317,14 @@ class Daemon:
                 chime(self.cfg, "start")
                 log(f"recording ({self.mode})…")
             elif event == hotkeys.STOP:
+                if not self.claim_take_end():
+                    return                     # duplicate STOP; see claim_take_end
                 self.stop_preview()
                 pcm = self.mic.stop()          # closes the mic
                 self.jobs.put((pcm, self.mode))
             elif event == hotkeys.CANCEL:
+                if not self.claim_take_end():
+                    return
                 self.stop_preview()
                 self.mic.stop()                # discard the take
                 self.set_state("idle")
