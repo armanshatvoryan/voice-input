@@ -60,3 +60,50 @@ Headless dual-model smoke (say→wav, both servers up):
 - Rebuild changes cdhash → TCC grant drops → user re-grants Accessibility (batch all changes → 1 rebuild).
 - Editing `voiceinput/*.py` needs venv reinstall to take effect in the .app (non-editable). `build_app.sh` reinstalls.
 - Right-option may report `alt_gr` on some setups — matcher accepts both.
+
+## Session 2026-08-01 — "HUD down again" (systematic-debugging)
+
+### Done
+- **Root-caused + fixed the duplicate-STOP race** (`voiceinput/daemon.py`, uncommitted).
+  The release watchdog and a key-up that merely arrived *late* both ended the same take:
+  the loser stopped an already-stopped mic (queuing a zero-length take — every phantom
+  `ignored 0ms/6ms tap` in the log) and re-entered `stop_preview()` while the winner was
+  parked in `join()`, clearing `preview_thread` under it →
+  `'NoneType' object has no attribute 'is_alive'` → `on_event` caught it, set `state=error`,
+  and skipped `mic.stop()` (leaking the InputStream into the next take).
+  Fix = `Daemon.claim_take_end()` (first ender wins, flag reset on START) + `_preview_lock`
+  around the preview-thread handover + local-ref read inside `stop_preview()`.
+- **2 regression tests** (`tests/test_daemon.py`): `test_second_stop_of_a_take_is_ignored`,
+  `test_two_threads_stopping_the_preview_do_not_race`. Both verified RED with only
+  `voiceinput/daemon.py` reverted (`git stash push` on the single file). **86 passed.**
+- Fix deployed into `/Applications/voice-input.app` via the `cp *.py` path; app restarted.
+
+### HUD — root cause NOT found (do not mark this done)
+Ruled out with evidence, not inspection:
+- preview whisper-server healthy (:8179, 0.57s decode on a real wav); `preview_enabled=True`
+- app main thread alive and rumps timers firing (`sample` → `__CFRunLoopDoTimers` → Python)
+- exactly one daemon (one pynput listener thread + one worker thread) — not a stale daemon
+  left over from a menu-bar Restart
+- panel exists with correct geometry (900x60 @ x=285 y=776), alpha 1.0, single display
+- live bundle sources byte-identical to repo HEAD before the fix
+
+🔑 **Decisive measurement:** polling `CGWindowListCreateDescriptionFromArray` at 20 Hz, the
+panel **never** became on-screen during `recording` periods lasting ≥0.45s. So
+`orderFrontRegardless()` is never reached — this is not a rendering/level/space problem.
+
+Leading hypothesis, UNCONFIRMED: `CaptionHUD.show()` raises *after* `_ensure()` has built the
+panel. `_hud_visible = True` is assigned on the line *after* `show()` returns, so an exception
+strands it `False`, and every subsequent 0.12s tick retries and re-raises. Sticky for the
+process lifetime; a restart clears it — which matches the symptom being "down **again**".
+
+🔑 A dead process cannot be autopsied here: no LaunchAgent, stderr goes nowhere, and the
+unified log has nothing, so an uncaught rumps-timer traceback is lost. Capture it LIVE.
+
+### Next (blocked on the human)
+- [ ] Hold the chord ~6s on the instrumented build, then read `~/Library/Logs/voice-input.log`
+      for `DIAG _preview …`, `DIAG show -> visible=… level=…`, `DIAG _preview raised: …`.
+      Two 15-minute monitor windows elapsed with zero holds.
+- [ ] 🔴 **Remove the temporary instrumentation.** `/Applications/voice-input.app/…/voiceinput/`
+      `menubar.py` + `hud.py` carry `DIAG` logging that is NOT in the repo. Restore with
+      `cp ~/voice-input/voiceinput/*.py <bundle>/…/voiceinput/ && rm -rf <bundle>/…/voiceinput/__pycache__`.
+- [ ] Commit + push the race fix (left uncommitted this session — on `main`, so branch first).
