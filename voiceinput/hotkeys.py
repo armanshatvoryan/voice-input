@@ -87,9 +87,15 @@ class ComboWatcher:
                 self.active = False
                 return CANCEL
             return None
-        if not _satisfies(self.key, name):
+        # The combo may be completed by ANY of its keys — people press two-key
+        # chords in either order, and requiring the main key last made roughly
+        # half of the holds start nothing.
+        if not (self._is_down(self.key) and all(self._is_down(m) for m in self.modifiers)):
             return None
-        if not all(self._is_down(m) for m in self.modifiers):
+        # ...but only a press that belongs to the combo may trigger it; an
+        # unrelated key while the chord happens to be down (e.g. right after a
+        # cancel) must not re-start the take.
+        if not (_satisfies(self.key, name) or any(_satisfies(m, name) for m in self.modifiers)):
             return None
         self.active = True
         if self.cleanup_modifier and self._is_down(self.cleanup_modifier):
@@ -112,11 +118,20 @@ class ComboWatcher:
         self.active = False
 
 
+# Physical keys we must recognise regardless of layout or held modifiers: with
+# cmd/alt down (or a RU layout active) the reported char for the Z key is not
+# "z", but its virtual keycode is stable.
+_VK_NAMES = {6: "z"}
+
+
 def _key_name(key) -> str:
     """Map a pynput key object to a lowercase name ComboWatcher understands."""
     name = getattr(key, "name", None)
     if name:
         return name.lower()
+    vk = getattr(key, "vk", None)
+    if vk in _VK_NAMES:
+        return _VK_NAMES[vk]
     char = getattr(key, "char", None)
     if char:
         return char.lower()
@@ -142,3 +157,57 @@ def listen(watcher: ComboWatcher, on_event: Callable[[str], None]):
     )
     listener.start()
     return listener
+
+
+# Physical key-state probes for the release watchdog (pynput key-up events are
+# occasionally dropped on fast taps, which would otherwise strand a hold forever).
+# Modifiers must be read from the event-source FLAGS (device-dependent bits) —
+# CGEventSourceKeyState does not reliably report held modifier keys.
+_MOD_FLAG_BITS = {
+    "ctrl_l": 0x0001, "ctrl_r": 0x2000, "ctrl": 0x2001,
+    "shift_l": 0x0002, "shift_r": 0x0004, "shift": 0x0006,
+    "cmd_l": 0x0008, "cmd_r": 0x0010, "cmd": 0x0018,
+    "alt_l": 0x0020, "alt_r": 0x0040, "alt_gr": 0x0040, "alt": 0x0060,
+}
+
+# Virtual keycodes for the non-modifier keys a combo can use.
+_KEYCODES = {"space": [49], "backspace": [51], "esc": [53]}
+
+
+def combo_tokens(modifiers, key: str) -> list[str]:
+    return [*modifiers, key]
+
+
+def combo_physically_down(tokens: list[str], flags: int, key_state) -> bool | None:
+    """Is every token of the combo still physically held?
+
+    `flags` is the current event-source flags word; `key_state(code)` answers for
+    plain keys. Returns None when any token is unknown — the caller must then
+    treat the state as unknowable and never force a stop.
+    """
+    for token in tokens:
+        bits = _MOD_FLAG_BITS.get(token)
+        if bits is not None:
+            if not flags & bits:
+                return False
+            continue
+        codes = _KEYCODES.get(token)
+        if not codes:
+            return None
+        if not any(key_state(code) for code in codes):
+            return False
+    return True
+
+
+def quartz_flags() -> int:
+    import Quartz
+
+    return int(Quartz.CGEventSourceFlagsState(
+        Quartz.kCGEventSourceStateCombinedSessionState))
+
+
+def quartz_key_state(keycode: int) -> bool:
+    import Quartz
+
+    return bool(Quartz.CGEventSourceKeyState(
+        Quartz.kCGEventSourceStateCombinedSessionState, keycode))

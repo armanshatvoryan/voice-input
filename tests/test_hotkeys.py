@@ -159,3 +159,49 @@ def test_cancel_key_configurable():
     assert w.press("alt_r") == START
     assert w.press("backspace") is None      # cancel disabled
     assert w.release("alt_r") == STOP
+
+
+def test_combo_physically_down_reads_modifiers_from_flags():
+    from voiceinput.hotkeys import combo_physically_down
+
+    tokens = ["cmd_r", "alt_r"]                    # rcmd=0x10, ralt=0x40
+    no_keys = lambda c: False
+    assert combo_physically_down(tokens, 0x10 | 0x40, no_keys) is True
+    assert combo_physically_down(tokens, 0x10, no_keys) is False   # alt_r released
+    assert combo_physically_down(tokens, 0x40, no_keys) is False   # cmd_r released
+    # generic token: either side's bit satisfies it
+    assert combo_physically_down(["cmd"], 0x10, no_keys) is True
+    assert combo_physically_down(["cmd"], 0x08, no_keys) is True
+
+
+def test_combo_physically_down_plain_key_uses_keycode_probe():
+    from voiceinput.hotkeys import combo_physically_down
+
+    tokens = ["ctrl", "alt", "space"]              # space = keycode 49
+    flags = 0x2001 | 0x0060                        # both generic modifiers down
+    assert combo_physically_down(tokens, flags, lambda c: c == 49) is True
+    assert combo_physically_down(tokens, flags, lambda c: False) is False
+    # unmapped key -> None: watchdog must opt out, not guess
+    assert combo_physically_down(["f19"], 0, lambda c: True) is None
+
+
+def test_combo_completes_in_either_press_order():
+    w = ComboWatcher(["cmd_r"], "alt_r", "shift")
+    assert w.press("alt_r") is None          # main key first
+    assert w.press("cmd_r") == START         # modifier completes the chord
+    assert w.release("cmd_r") == STOP
+
+    w2 = ComboWatcher(["cmd_r"], "alt_r", "shift")
+    assert w2.press("cmd_r") is None
+    assert w2.press("alt_r") == START        # classic order still works
+    assert w2.release("alt_r") == STOP
+
+
+def test_unrelated_key_never_starts_a_take():
+    w = ComboWatcher(["cmd_r"], "alt_r", "shift", cancel_key="z")
+    w.press("cmd_r")
+    assert w.press("alt_r") == START
+    assert w.press("z") == CANCEL
+    # chord still physically down; an unrelated press must not re-start
+    assert w.press("x") is None
+    assert w.press("z") is None

@@ -43,7 +43,9 @@ def log(message: str) -> None:
     print(line, file=sys.stderr, flush=True)
     try:
         APP_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with APP_LOG.open("a") as fh:
+        # Explicit utf-8: the .app runs under a POSIX locale where the default
+        # codec is ASCII, and a non-ASCII message would silently vanish here.
+        with APP_LOG.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     except Exception:
         pass
@@ -72,6 +74,7 @@ class Daemon:
         self.server_proc: subprocess.Popen | None = None
         self.mic: audio.MicStream | None = None
         self.listener = None
+        self.watcher: hotkeys.ComboWatcher | None = None
         self.worker: threading.Thread | None = None
         self.mode = "raw"
         self.stopping = threading.Event()
@@ -176,12 +179,16 @@ class Daemon:
 
     def preview_decode(self, pcm) -> str:
         """Fast partial transcript from the preview (base) model."""
-        wav = audio.to_wav(pcm, self.cfg["audio"]["samplerate"])
-        raw = transcribe.transcribe(
-            wav, self.preview_url, language=self.cfg["language"],
-            audio_ctx=transcribe.FULL_CONTEXT, timeout=15,
-        )
-        return text.clean(raw)
+        try:
+            wav = audio.to_wav(pcm, self.cfg["audio"]["samplerate"])
+            raw = transcribe.transcribe(
+                wav, self.preview_url, language=self.cfg["language"],
+                audio_ctx=transcribe.FULL_CONTEXT, timeout=15,
+            )
+            return text.clean(raw)
+        except Exception as exc:
+            log(f"preview decode failed: {exc}")
+            raise
 
     def emit_partial(self, partial: str) -> None:
         # A preview thread that outlived its join timeout may still emit one late
@@ -227,6 +234,44 @@ class Daemon:
         self.preview_thread = None
         self.preview_stop = None
 
+    # ---- release watchdog ------------------------------------------------
+
+    def start_release_watchdog(self) -> None:
+        """Backstop for dropped key-up events: macOS occasionally swallows the
+        release of a fast/gentle tap, which would leave the take (and the HUD)
+        running forever. While recording, poll the OS for the combo's physical
+        key state and force a STOP when the keys are actually up."""
+        threading.Thread(target=self._release_watchdog, daemon=True).start()
+
+    def _release_watchdog(self) -> None:
+        hk = self.cfg["hotkey"]
+        tokens = hotkeys.combo_tokens(hk["modifiers"], hk["key"])
+        up_polls = 0
+        while self.state == "recording" and not self.stopping.is_set():
+            time.sleep(0.15)
+            if self.state != "recording":
+                return
+            try:
+                down = hotkeys.combo_physically_down(
+                    tokens, hotkeys.quartz_flags(), hotkeys.quartz_key_state)
+            except Exception:
+                return                 # Quartz unavailable; never break the take
+            if down is None:
+                return                 # unmapped custom key; watchdog unavailable
+            if down:
+                up_polls = 0
+                continue
+            # Debounced: require several consecutive "up" reads before forcing a
+            # stop, so one glitchy poll can't truncate a live take.
+            up_polls += 1
+            if up_polls < 3:
+                continue
+            log("key release event was dropped — watchdog stopping the take")
+            if self.watcher is not None:
+                self.watcher.reset()
+            self.on_event(hotkeys.STOP)
+            return
+
     # ---- hotkey events ---------------------------------------------------
 
     def on_event(self, event: str) -> None:
@@ -239,6 +284,7 @@ class Daemon:
                 self.set_state("recording")
                 self.mic.start()               # on-demand: opens the mic now
                 self.start_preview()
+                self.start_release_watchdog()
                 chime(self.cfg, "start")
                 log(f"recording ({self.mode})…")
             elif event == hotkeys.STOP:
@@ -354,6 +400,7 @@ class Daemon:
             return False
 
         self.preview_enabled = self.ensure_preview_server()
+        log(f"live preview {'on' if self.preview_enabled else 'off'} (HUD partials)")
 
         self.mic = audio.MicStream(
             samplerate=self.cfg["audio"]["samplerate"],
@@ -375,6 +422,7 @@ class Daemon:
             self.cfg["hotkey"]["cleanup_modifier"],
             cancel_key=self.cfg["hotkey"].get("cancel_key", "backspace"),
         )
+        self.watcher = watcher
         self.listener = hotkeys.listen(watcher, self.on_event)
 
         if install_signals:
