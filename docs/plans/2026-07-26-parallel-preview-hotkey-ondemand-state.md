@@ -107,3 +107,52 @@ unified log has nothing, so an uncaught rumps-timer traceback is lost. Capture i
       `menubar.py` + `hud.py` carry `DIAG` logging that is NOT in the repo. Restore with
       `cp ~/voice-input/voiceinput/*.py <bundle>/…/voiceinput/ && rm -rf <bundle>/…/voiceinput/__pycache__`.
 - [ ] Commit + push the race fix (left uncommitted this session — on `main`, so branch first).
+
+---
+
+## 2026-08-06 — mic wedge (PaErrorCode -9986) after a watchdog-ended take
+
+Symptom: `--doctor` reported `FAIL microphone — Error opening InputStream: Internal PortAudio
+error [PaErrorCode -9986]` and `FAIL whisper-server reachable`. Neither FAIL meant what the
+doctor's printed advice said.
+
+### Root cause (evidence, not inspection)
+One `.app` process had been alive since Aug-5 (`ps -o etime` = 1d 02:27). Its log shows the
+sequence: a successful 33.3s dictation → `key release event was dropped — watchdog stopping the
+take` → from that point on **every** `InputStream` open in that process fails `-9986`, including
+across menu-bar Restart cycles (Restart reuses the same process).
+
+Ruled out:
+- **Not TCC.** `log show --predicate 'subsystem == "com.apple.TCC" … kTCCServiceMicrophone'`
+  over the failure window shows **zero** requests attributable to `studio.arag.voice-input`.
+- **Not the device.** A *fresh* process (`.venv/bin/python`, `sd.rec` 1s @16kHz) opened the
+  same default device (`0 Микрофон MacBook Air`) with no exception.
+
+So: process-scoped PortAudio/CoreAudio state corruption that survives the daemon's own internal
+restart. The `ac6ac0a` serialise-teardown fix does **not** close this path.
+
+### Fix applied (recovery, not a code fix)
+`kill <pid>` + `open -a /Applications/voice-input.app`. Verified after relaunch: boot mic probe
+passes (no `microphone unavailable` line), `state=idle`, `ready` banner, both whisper-servers
+answer 200 on :8178 and :8179. The second FAIL was benign — the daemon spawns the server.
+
+### Hardening candidate — NOT built, needs approval
+On `-9986`, re-exec the whole process (`os.execv`) instead of the internal daemon restart, since
+the internal restart demonstrably cannot clear the wedged audio state.
+
+### 🔑 Two traps that cost time here
+- **`--doctor`'s mic check false-FAILs from any CC Cockpit / claude-code shell.** The responsible
+  app resolves to `studio.arag.cc-cockpit`, whose Info.plist has no `NSMicrophoneUsageDescription`,
+  so tccd logs `Refusing authorization request … without NSMicrophoneUsageDescription key` — no
+  prompt, no Settings entry possible, no way to grant. Trust only the menu-bar "Run doctor…" or a
+  real dictation. The printed SETTINGS_HELP is actively misleading in that context.
+- **`open -a` on an already-running app is a no-op.** Check `ps -o etime` before believing a
+  relaunch happened. (Also: zsh shadows `/usr/bin/log` with a builtin — `log show` returns
+  "too many arguments"; call `/usr/bin/log` by absolute path.)
+
+### HUD — one new data point
+This session's log contains `DIAG show -> visible=True level=3` followed by
+`DIAG _preview want=True hud_visible=True … state=recording` during the successful 33.3s take.
+So on that take `show()` did **not** raise and the HUD path completed. Consistent with the
+"sticky per-process after a failure" hypothesis; still not a root cause. Instrumentation is
+still in the bundle — removal remains owed (see the Next list above).
