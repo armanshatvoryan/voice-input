@@ -12,11 +12,12 @@ from __future__ import annotations
 import contextlib
 import io
 import threading
+import time
 
 import rumps
 
 from . import config, hotkeys, hud
-from .daemon import Daemon, doctor
+from .daemon import Daemon, doctor, log
 
 # Menu-bar glyph per daemon state. Kept to a single character — the menu bar is
 # tiny and a wide emoji jitters the layout.
@@ -46,7 +47,8 @@ class VoiceInputApp(rumps.App):
         self.daemon: Daemon | None = None
         self._last_state = None
         self.hud = hud.CaptionHUD()
-        self._hud_visible = False
+        self._hud_error = None
+        self._hud_error_at = 0.0
 
         hk = self.cfg["hotkey"]
         combo = hotkeys.describe(hk["modifiers"], hk["key"])
@@ -92,19 +94,23 @@ class VoiceInputApp(rumps.App):
     # The HUD is AppKit; this timer runs on the main Cocoa thread, so it is the only
     # safe place to touch the panel. It just mirrors the daemon's live-preview state,
     # which the daemon writes from its own threads (plain string/bool, no lock).
+    # Stateless on purpose: real panel visibility is re-asserted from daemon state
+    # every tick (see CaptionHUD.sync), so no failure can strand the HUD for the
+    # rest of the process — the 2026-08-01 incident.
     @rumps.timer(0.12)
     def _preview(self, _timer) -> None:
         d = self.daemon
         want = bool(d and d.preview_enabled and d.state in ("recording", "working"))
-        if want:
-            if not self._hud_visible:
-                self.hud.show(d.partial_text)
-                self._hud_visible = True
-            else:
-                self.hud.update(d.partial_text)
-        elif self._hud_visible:
-            self.hud.hide()
-            self._hud_visible = False
+        try:
+            self.hud.sync(want, d.partial_text if d else "")
+        except Exception as exc:
+            # The .app has no stderr; an unlogged timer exception is invisible.
+            # Rate-limited so a persistent failure can't flood the log at 8Hz.
+            now = time.monotonic()
+            if repr(exc) != self._hud_error or now - self._hud_error_at > 60:
+                self._hud_error = repr(exc)
+                self._hud_error_at = now
+                log(f"HUD error (retrying every tick): {exc!r}")
 
     # ---- menu actions ----------------------------------------------------
 

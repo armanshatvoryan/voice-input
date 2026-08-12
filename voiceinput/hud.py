@@ -33,11 +33,28 @@ class CaptionHUD:
 
     # ---- construction (main thread) --------------------------------------
 
+    @staticmethod
+    def _screen_frame():
+        """Current main-screen frame; falls back to the first screen.
+
+        mainScreen() can return None (screens asleep, display reconfiguring) —
+        raising here is fine, the caller's timer retries next tick.
+        """
+        from AppKit import NSScreen
+
+        screen = NSScreen.mainScreen()
+        if screen is None:
+            screens = NSScreen.screens()
+            if not screens:
+                raise RuntimeError("no screens attached")
+            screen = screens[0]
+        return screen.frame()
+
     def _ensure(self):
         if self._panel is not None:
             return
         from AppKit import (
-            NSPanel, NSTextField, NSView, NSColor, NSFont, NSScreen,
+            NSPanel, NSTextField, NSView, NSColor, NSFont,
             NSBackingStoreBuffered, NSStatusWindowLevel,
             NSWindowStyleMaskBorderless, NSWindowStyleMaskNonactivatingPanel,
             NSWindowCollectionBehaviorCanJoinAllSpaces,
@@ -47,7 +64,7 @@ class CaptionHUD:
         )
         from Foundation import NSMakeRect
 
-        screen = NSScreen.mainScreen().frame()
+        screen = self._screen_frame()
         width = min(screen.size.width - 160, 900.0)
         x, y = hud_frame(screen.size.width, screen.size.height, width, self.HEIGHT,
                          self.MARGIN_BOTTOM)
@@ -59,7 +76,6 @@ class CaptionHUD:
             NSBackingStoreBuffered,
             False,
         )
-        panel.setLevel_(NSStatusWindowLevel)
         panel.setOpaque_(False)
         panel.setBackgroundColor_(NSColor.clearColor())
         panel.setHasShadow_(True)
@@ -67,6 +83,9 @@ class CaptionHUD:
         panel.setFloatingPanel_(True)
         panel.setBecomesKeyOnlyIfNeeded_(True)
         panel.setHidesOnDeactivate_(False)
+        # AFTER setFloatingPanel_: that setter silently resets the level to
+        # floating (3), which would leave the HUD under fullscreen overlays.
+        panel.setLevel_(NSStatusWindowLevel)
         panel.setCollectionBehavior_(
             NSWindowCollectionBehaviorCanJoinAllSpaces
             | NSWindowCollectionBehaviorFullScreenAuxiliary
@@ -103,15 +122,38 @@ class CaptionHUD:
 
     # ---- main-thread API --------------------------------------------------
 
+    def sync(self, want: bool, text: str = "") -> None:
+        """Reconcile the panel with what the daemon wants, idempotently.
+
+        Called every timer tick. Deliberately stateless: the 2026-08-01 "HUD
+        down" incident was a shadow visibility bool diverging from real AppKit
+        state — one stranded flag and the panel never got another orderFront
+        for the life of the process. Re-asserting visibility each tick means
+        anything that knocks the panel out behind our back (a Space/display
+        change, a half-run hide, one raised AppKit call) heals on the next tick.
+        """
+        if want:
+            self.show(text)
+        else:
+            self.hide()
+
     def show(self, text: str = "") -> None:
         self._ensure()
         self._label.setStringValue_(text or "…")
+        self._reposition()
         self._panel.orderFrontRegardless()
 
-    def update(self, text: str) -> None:
-        if self._panel is None:
-            return self.show(text)
-        self._label.setStringValue_(text or "…")
+    def _reposition(self) -> None:
+        """Re-center on the current screen; displays may have changed since
+        the panel was built, and a stale origin can place it off every screen —
+        'visible' to AppKit, no pixels anywhere."""
+        from Foundation import NSMakePoint
+
+        screen = self._screen_frame()
+        width = self._panel.frame().size.width
+        x, y = hud_frame(screen.size.width, screen.size.height, width, self.HEIGHT,
+                         self.MARGIN_BOTTOM)
+        self._panel.setFrameOrigin_(NSMakePoint(x, y))
 
     def hide(self) -> None:
         if self._panel is not None:
