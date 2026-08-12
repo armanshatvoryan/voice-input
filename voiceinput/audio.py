@@ -20,6 +20,22 @@ import numpy as np
 BLOCKSIZE = 1024  # 64 ms at 16 kHz
 
 
+def _reset_portaudio() -> None:
+    """Re-initialise PortAudio so it re-reads the CoreAudio device table.
+
+    PortAudio snapshots devices (and the default input) once per process. If
+    the device it cached disappears afterwards — a Bluetooth mic disconnecting
+    is the common case — every later open fails with paInternalError (-9986,
+    kAudioHardwareBadObjectError underneath) until the library is torn down
+    and brought back up. Only safe while no stream is open, which is how
+    MicStream uses it.
+    """
+    import sounddevice as sd
+
+    sd._terminate()
+    sd._initialize()
+
+
 def to_wav(pcm: np.ndarray, samplerate: int) -> bytes:
     """Wrap mono int16 samples in a RIFF container (what whisper-server expects)."""
     buffer = io.BytesIO()
@@ -36,7 +52,8 @@ def duration_ms(pcm: np.ndarray, samplerate: int) -> float:
 
 
 class MicStream:
-    def __init__(self, samplerate=16000, device=None, max_s=180, stream_factory=None):
+    def __init__(self, samplerate=16000, device=None, max_s=180, stream_factory=None,
+                 reset_portaudio=None):
         self.samplerate = samplerate
         self.device = device
         self.max_frames = int(max_s * samplerate)
@@ -46,6 +63,7 @@ class MicStream:
         self._stream = None
         self.overflowed = False
         self._stream_factory = stream_factory or self._default_factory
+        self._reset_portaudio = reset_portaudio or _reset_portaudio
 
     # ---- device -----------------------------------------------------------
 
@@ -80,6 +98,36 @@ class MicStream:
                     pass
             self._stream = None
 
+    def _open_started_stream(self):
+        """One factory + start attempt; the stream never leaks on failure."""
+        stream = self._stream_factory()
+        try:
+            stream.start()
+        except Exception:
+            for step in (stream.stop, stream.close):
+                try:
+                    step()
+                except Exception:
+                    pass
+            raise
+        return stream
+
+    def _open_with_retry(self):
+        """Open the stream, retrying once on a fresh PortAudio device table.
+
+        PortAudio's table is a per-process snapshot; if the cached device (or
+        cached default input) has since vanished — Bluetooth mic disconnected —
+        the open fails -9986 forever. Re-initialising the library re-reads the
+        table, so the retry lands on a device that actually exists. Safe here
+        because this MicStream is the process's only PortAudio user and holds
+        no open stream at this point.
+        """
+        try:
+            return self._open_started_stream()
+        except Exception:
+            self._reset_portaudio()
+            return self._open_started_stream()
+
     def probe(self) -> None:
         """Open + close the device once to trigger the macOS mic-permission prompt.
 
@@ -87,8 +135,7 @@ class MicStream:
         its only job is to make the app appear in Privacy > Microphone up front
         instead of mid-dictation.
         """
-        stream = self._stream_factory()
-        stream.start()
+        stream = self._open_with_retry()
         stream.stop()
         stream.close()
 
@@ -99,17 +146,11 @@ class MicStream:
             self._frames = []
             self.overflowed = False
             self._recording = True
-        stream = self._stream_factory()
         try:
-            stream.start()
+            stream = self._open_with_retry()
         except Exception:
             with self._lock:
                 self._recording = False
-            for step in (stream.stop, stream.close):
-                try:
-                    step()
-                except Exception:
-                    pass
             raise
         self._stream = stream
 

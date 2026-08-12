@@ -95,22 +95,25 @@ def test_probe_opens_and_closes_without_recording():
     assert len(mic.snapshot()) == 0
 
 
+class BoomStream:
+    def __init__(self):
+        self.closed = False
+
+    def start(self):
+        raise RuntimeError("device busy")
+
+    def stop(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
 def test_start_failure_closes_stream_and_resets_recording():
-    class BoomStream:
-        def __init__(self):
-            self.closed = False
-
-        def start(self):
-            raise RuntimeError("device busy")
-
-        def stop(self):
-            pass
-
-        def close(self):
-            self.closed = True
-
     boom = BoomStream()
-    mic = audio.MicStream(stream_factory=lambda: boom)
+    resets = []
+    mic = audio.MicStream(stream_factory=lambda: boom,
+                          reset_portaudio=lambda: resets.append(1))
     try:
         mic.start()
         assert False, "expected RuntimeError"
@@ -119,3 +122,32 @@ def test_start_failure_closes_stream_and_resets_recording():
     assert boom.closed
     assert not mic.recording
     assert mic._stream is None
+    assert resets == [1]                # one reset attempt, not a retry loop
+
+
+def test_start_retries_once_on_a_fresh_device_table():
+    # A device that vanished after PortAudio cached the table (BT mic
+    # disconnect) fails every open until the library is re-initialised; the
+    # first failure must trigger one reset + one retry, then succeed.
+    streams = [BoomStream(), FakeStream()]
+    resets = []
+    mic = audio.MicStream(stream_factory=lambda: streams.pop(0),
+                          reset_portaudio=lambda: resets.append(1))
+    mic.start()
+    assert resets == [1]
+    assert mic.recording
+    assert mic._stream is not None
+    mic._callback(block(7), 1024, None, None)
+    assert len(mic.stop()) == 1024      # retried stream actually captures
+
+
+def test_probe_retries_once_on_a_fresh_device_table():
+    good = FakeStream()
+    streams = [BoomStream(), good]
+    resets = []
+    mic = audio.MicStream(stream_factory=lambda: streams.pop(0),
+                          reset_portaudio=lambda: resets.append(1))
+    mic.probe()
+    assert resets == [1]
+    assert good.closed
+    assert not mic.recording

@@ -156,3 +156,36 @@ This session's log contains `DIAG show -> visible=True level=3` followed by
 So on that take `show()` did **not** raise and the HUD path completed. Consistent with the
 "sticky per-process after a failure" hypothesis; still not a root cause. Instrumentation is
 still in the bundle — removal remains owed (see the Next list above).
+
+---
+
+## 2026-08-12 — -9986 ROOT CAUSE FOUND, FIXED, PROVEN (scripted, no live holds needed)
+
+**The watchdog correlation was spurious.** Real mechanism, proven end-to-end:
+
+1. PortAudio snapshots the CoreAudio device table (and default input) **once per process**
+   (`Pa_Initialize` at sounddevice import).
+2. The app booted while a Bluetooth mic was default input (unified log 13:20:28: input device 93,
+   24 kHz, BT UID `30-82-16-A1-1B-86`).
+3. The BT device disconnected mid-lifetime → CoreAudio deleted object 93.
+4. Every later open resolved to the cached dead ID → HAL returned `kAudioHardwareBadObjectError`
+   (`'!obj'` = 560947818, visible in unified log at wedge onset 14:14:50:
+   `AudioObjectGetPropertyData: no object with given ID 93`) → PortAudio wraps any unknown
+   OSStatus as **paInternalError -9986**. Forever, in that process.
+5. Menubar Restart shares the process → same stale table → cannot cure. Fresh process
+   re-enumerates → cures. Matches every prior observation, including zero tccd activity.
+   The "0-frame takes" phase before full failure = half-dead BT route still listed but silent.
+
+**Repro + proof (no human, no BT hardware):** `scripts/repro_9986_selfheal.py` — creates an
+aggregate device wrapping the built-in mic, makes it the system default input, lets PortAudio
+cache it, records a take, destroys the aggregate (the "AirPods disconnect"), records again.
+Unfixed code: exact `PaErrorCode -9986`. Note: a *private* aggregate cannot become default
+input (the set silently no-ops) — the harness asserts the default actually moved.
+
+**Fix (audio.py):** `MicStream._open_with_retry()` — on any open failure, `sd._terminate()` +
+`sd._initialize()` (re-reads the device table + default), retry once. Applied to both `start()`
+and `probe()`. Safe because MicStream is the process's only PortAudio user and holds no open
+stream at that point. 3 new unit tests (verified RED first); integration harness passes
+(`SELF-HEAL PASS`); suite 88 green.
+
+**Still open, unrelated to -9986:** HUD root cause; DIAG instrumentation still in the bundle.
