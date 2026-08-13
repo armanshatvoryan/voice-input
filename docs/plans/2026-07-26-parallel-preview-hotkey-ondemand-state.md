@@ -189,3 +189,39 @@ stream at that point. 3 new unit tests (verified RED first); integration harness
 (`SELF-HEAL PASS`); suite 88 green.
 
 **Still open, unrelated to -9986:** HUD root cause; DIAG instrumentation still in the bundle.
+
+## 2026-08-13 — HUD wedge #2 ROOT-CAUSED LIVE, FIXED, DEPLOYED (`b750334`)
+
+Not a recurrence of the 08-01 shadow-bool class (d536345 code was running and healthy).
+New class, isolated with live evidence:
+
+1. HUD worked all evening 08-12 in the process started 16:11 (post-d536345 deploy).
+2. Overnight sleep → from the morning on, the **window server silently ignored
+   `orderFrontRegardless`** for the existing panel: AppKit `isVisible()=True`, but an external
+   20 Hz `CGWindowListCopyWindowInfo` monitor showed `kCGWindowIsOnscreen` NEVER true during
+   real takes. Everything else proven healthy in the wedged process: rumps timers firing
+   (glyph went 🔴), `want=True` path intact, preview server up, zero exceptions logged, panel
+   geometry/level correct on the server side (it even animated through Space switches — hidden).
+3. Menubar **daemon Restart did NOT cure** (same NSWindow); full process relaunch did.
+4. Post-relaunch, in-bundle DIAG2 + the same external monitor proved the whole chain green:
+   `want -> True` → `show visible=True level=25` → server `IsOnscreen=True`, HUD visible to user.
+
+**Fix (hud.py):** `show()` now cross-checks the *server's* truth — `CGWindowListCopyWindowInfo`
+by `windowNumber()`, rate-limited to 1/s. If AppKit believes visible but the server says the
+window is not ordered in, log `HUD desync: window server dropped the panel — rebuilding`,
+discard the panel; the next 0.12 s tick rebuilds a fresh NSWindow = fresh server-side identity.
+Re-ordering the same defunct window can never heal this class — a new window can.
+
+**menubar.py:** permanent per-take transitions `HUD show/hide (state=…)` (2 lines/take) so any
+future wedge is diagnosable from the log alone, no instrumentation round.
+
+Tests: rebuild regression test verified RED first; 92 green. Gotcha for the suite: a bare
+pytest process's NSPanels are NEVER server-onscreen (no app activation) — `_server_onscreen()`
+returns a real False there, so non-verification tests opt out via `_verified_at = inf`.
+
+Deploy: cp into bundle (DIAG2 replaced by final code), bundle==repo, app relaunched 13:11.
+**Live smoke pending:** next real dictation eyeball; expect `HUD show (state=recording)` lines.
+
+**Still open (new, separate):** release watchdog truncates some long holds — repeated
+`key release event was dropped — watchdog stopping the take` on ~6 s holds that produced
+1.0–2.0 s takes (observed 12:19–12:29). Chord/watchdog defect, not HUD, not investigated.
