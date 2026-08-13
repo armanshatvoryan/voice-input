@@ -30,6 +30,7 @@ class CaptionHUD:
     def __init__(self):
         self._panel = None
         self._label = None
+        self._verified_at = 0.0
 
     # ---- construction (main thread) --------------------------------------
 
@@ -142,6 +143,55 @@ class CaptionHUD:
         self._label.setStringValue_(text or "…")
         self._reposition()
         self._panel.orderFrontRegardless()
+        self._verify_server()
+
+    def _server_onscreen(self):
+        """Ask the window server — not AppKit — whether the panel is ordered in.
+
+        Returns True/False, or None when the question can't be answered (no
+        panel, no window number yet, Quartz unavailable). AppKit's isVisible()
+        is this process's belief; CGWindowList is the server's truth, and the
+        2026-08-13 wedge proved they can diverge for a process's lifetime.
+        """
+        if self._panel is None:
+            return None
+        try:
+            import Quartz
+
+            num = self._panel.windowNumber()
+            if num <= 0:
+                return None
+            info = Quartz.CGWindowListCopyWindowInfo(
+                Quartz.kCGWindowListOptionIncludingWindow, num)
+            if not info:
+                return False
+            return bool(info[0].get("kCGWindowIsOnscreen"))
+        except Exception:
+            return None     # diagnostics must never break the HUD itself
+
+    def _verify_server(self) -> None:
+        """Heal the 2026-08-13 wedge class: after an overnight sleep the window
+        server silently stopped honoring orderFrontRegardless for the existing
+        panel (AppKit visible=True, server onscreen=False, every take, until
+        the process was relaunched). Re-ordering the same window can't cure
+        that, so on divergence discard the panel — the next 0.12s tick rebuilds
+        a fresh window with a new server-side identity. Checked at most 1/s."""
+        import time
+
+        now = time.monotonic()
+        if now - self._verified_at < 1.0:
+            return
+        self._verified_at = now
+        if self._server_onscreen() is False:
+            from .daemon import log
+
+            log("HUD desync: window server dropped the panel — rebuilding")
+            try:
+                self._panel.orderOut_(None)
+            except Exception:
+                pass
+            self._panel = None
+            self._label = None
 
     def _reposition(self) -> None:
         """Re-center on the current screen; displays may have changed since

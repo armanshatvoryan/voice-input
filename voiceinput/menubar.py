@@ -49,6 +49,7 @@ class VoiceInputApp(rumps.App):
         self.hud = hud.CaptionHUD()
         self._hud_error = None
         self._hud_error_at = 0.0
+        self._hud_want = None
 
         hk = self.cfg["hotkey"]
         combo = hotkeys.describe(hk["modifiers"], hk["key"])
@@ -101,6 +102,11 @@ class VoiceInputApp(rumps.App):
     def _preview(self, _timer) -> None:
         d = self.daemon
         want = bool(d and d.preview_enabled and d.state in ("recording", "working"))
+        if want != self._hud_want:
+            # Two lines per take, forever: when the HUD wedges again (08-01,
+            # 08-13), the log must already show whether the intent was there.
+            self._hud_want = want
+            log(f"HUD {'show' if want else 'hide'} (state={d.state if d else '-'})")
         try:
             self.hud.sync(want, d.partial_text if d else "")
         except Exception as exc:
