@@ -66,3 +66,8 @@ def test_single_word_stutter_is_not_flagged():
 def test_short_text_is_safe():
     assert not has_repetition_loop("")
     assert not has_repetition_loop("hello")
+
+
+def test_korean_news_sign_off_hallucination_is_dropped():
+    # Small-model auto-detect emits this on the near-silent start of a take.
+    assert clean("MBC 뉴스 김성현입니다.") == ""
